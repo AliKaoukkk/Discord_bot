@@ -7,6 +7,7 @@ import(
 	"os/signal"
 	"syscall"
 	"os/exec"
+	"sync"
 
 	"github.com/disgoorg/disgo"
 	"github.com/disgoorg/disgo/bot"
@@ -20,6 +21,16 @@ import(
 	"github.com/disgoorg/godave/golibdave"
 
 )
+type playback struct {
+	ytdlp  *exec.Cmd
+	ffmpeg *exec.Cmd
+}
+
+var (
+	playersMu sync.Mutex
+	players   = map[snowflake.ID]*playback{}
+)
+
 var commands = []discord.ApplicationCommandCreate{
 	discord.SlashCommandCreate{
 		Name:        "ping",
@@ -51,6 +62,10 @@ var commands = []discord.ApplicationCommandCreate{
 				Required:    true,
 			},
 		},
+	},
+	discord.SlashCommandCreate{
+		Name:        "stop",
+		Description: "Stop the music",
 	},
 }
 
@@ -114,6 +129,13 @@ func onCommand(event *events.ApplicationCommandInteractionCreate) {
 		}
 		event.CreateMessage(discord.NewMessageCreate().WithContent("Loading 🎵"))
 		go playSong(event.Client(), guildID, url)
+
+	case "stop":
+		if stopPlayback(guildID) {
+			event.CreateMessage(discord.NewMessageCreate().WithContent("Stopped ⏹️"))
+		} else {
+			event.CreateMessage(discord.NewMessageCreate().WithContent("Nothing is playing"))
+		}
 	}
 }
 
@@ -147,6 +169,7 @@ func leaveChannel(client *bot.Client, guildID snowflake.ID) {
 func playSong(client *bot.Client, guildID snowflake.ID, url string) {
 	conn := client.VoiceManager.GetConn(guildID)
 	if conn == nil {
+		stopPlayback(guildID)
 		return
 	}
 
@@ -191,8 +214,15 @@ func playSong(client *bot.Client, guildID snowflake.ID, url string) {
 	}
 	if err := ffmpeg.Start(); err != nil {
 		fmt.Println("ffmpeg start error:", err)
+		ytdlp.Process.Kill()
+		ytdlp.Wait()
 		return
 	}
+
+	pb := &playback{ytdlp: ytdlp, ffmpeg: ffmpeg}
+	playersMu.Lock()
+	players[guildID] = pb
+	playersMu.Unlock()
 
 	provider := NewOggOpusProvider(ffOut)
 
@@ -209,5 +239,30 @@ func playSong(client *bot.Client, guildID snowflake.ID, url string) {
 
 	ffmpeg.Wait()
 	ytdlp.Wait()
+
+	playersMu.Lock()
+	if players[guildID] == pb {
+		delete(players, guildID)
+	}
+	playersMu.Unlock()
+
+	endCtx, endCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer endCancel()
+	conn.SetSpeaking(endCtx, voice.SpeakingFlagNone)
+
 	fmt.Println("finished:", url)
+}
+
+func stopPlayback(guildID snowflake.ID) bool {
+	playersMu.Lock()
+	pb := players[guildID]
+	delete(players, guildID)
+	playersMu.Unlock()
+
+	if pb == nil {
+		return false
+	}
+	pb.ffmpeg.Process.Kill()
+	pb.ytdlp.Process.Kill()
+	return true
 }
