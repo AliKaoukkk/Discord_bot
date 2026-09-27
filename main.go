@@ -6,6 +6,7 @@ import(
 	"context"
 	"os/signal"
 	"syscall"
+	"os/exec"
 
 	"github.com/disgoorg/disgo"
 	"github.com/disgoorg/disgo/bot"
@@ -39,6 +40,17 @@ var commands = []discord.ApplicationCommandCreate{
 	discord.SlashCommandCreate{
 		Name:        "leave",
 		Description: "Leave the voice channel",
+	},
+	discord.SlashCommandCreate{
+		Name:        "play",
+		Description: "Play audio from a YouTube link",
+		Options: []discord.ApplicationCommandOption{
+			discord.ApplicationCommandOptionString{
+				Name:        "url",
+				Description: "YouTube link",
+				Required:    true,
+			},
+		},
 	},
 }
 
@@ -93,8 +105,18 @@ func onCommand(event *events.ApplicationCommandInteractionCreate) {
 	case "leave":
 		event.CreateMessage(discord.NewMessageCreate().WithContent("Leaving 👋"))
 		go leaveChannel(event.Client(), guildID)
+
+	case "play":
+		url := data.String("url")
+		if event.Client().VoiceManager.GetConn(guildID) == nil {
+			event.CreateMessage(discord.NewMessageCreate().WithContent("Use /join first 🔊"))
+			return
+		}
+		event.CreateMessage(discord.NewMessageCreate().WithContent("Loading 🎵"))
+		go playSong(event.Client(), guildID, url)
 	}
 }
+
 func joinChannel(client *bot.Client, guildID, channelID snowflake.ID) {
 	conn := client.VoiceManager.CreateConn(guildID)
 
@@ -120,4 +142,72 @@ func leaveChannel(client *bot.Client, guildID snowflake.ID) {
 
 	conn.Close(ctx)
 	fmt.Println("left voice channel")
+}
+
+func playSong(client *bot.Client, guildID snowflake.ID, url string) {
+	conn := client.VoiceManager.GetConn(guildID)
+	if conn == nil {
+		return
+	}
+
+	ytdlp := exec.Command("yt-dlp",
+		"-f", "bestaudio",
+		"--no-playlist",
+		"--quiet",
+		"-o", "-",
+		"--", url,
+	)
+	ffmpeg := exec.Command("ffmpeg",
+		"-loglevel", "error",
+		"-i", "pipe:0",
+		"-c:a", "libopus",
+		"-b:a", "128k",
+		"-ar", "48000",
+		"-ac", "2",
+		"-frame_duration", "20",
+		"-f", "ogg",
+		"pipe:1",
+	)
+
+	ytOut, err := ytdlp.StdoutPipe()
+	if err != nil {
+		fmt.Println("yt-dlp pipe error:", err)
+		return
+	}
+	ffmpeg.Stdin = ytOut
+
+	ffOut, err := ffmpeg.StdoutPipe()
+	if err != nil {
+		fmt.Println("ffmpeg pipe error:", err)
+		return
+	}
+
+	ytdlp.Stderr = os.Stderr
+	ffmpeg.Stderr = os.Stderr
+
+	if err := ytdlp.Start(); err != nil {
+		fmt.Println("yt-dlp start error:", err)
+		return
+	}
+	if err := ffmpeg.Start(); err != nil {
+		fmt.Println("ffmpeg start error:", err)
+		return
+	}
+
+	provider := NewOggOpusProvider(ffOut)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := conn.SetSpeaking(ctx, voice.SpeakingFlagMicrophone); err != nil {
+		fmt.Println("speaking error:", err)
+		return
+	}
+	conn.SetOpusFrameProvider(provider)
+	fmt.Println("playing:", url)
+
+	<-provider.done
+
+	ffmpeg.Wait()
+	ytdlp.Wait()
+	fmt.Println("finished:", url)
 }
